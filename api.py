@@ -164,3 +164,17 @@ async def wa_receive(request: Request):
     except Exception as e:
         print("WA parse error:", e)
     return {"ok": True}
+
+from fastapi import Query
+
+VERIFY_TOKEN = "mybotverify"  # Webhook sayfasına yazdığın token ile aynı olmalı
+
+@app.get("/whatsapp/webhook")
+def wa_verify(
+    hub_mode: str = Query(..., alias="hub.mode"),
+    hub_challenge: str = Query(..., alias="hub.challenge"),
+    hub_verify_token: str = Query(..., alias="hub.verify_token")
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return int(hub_challenge)
+    return {"error": "Verification failed"}
