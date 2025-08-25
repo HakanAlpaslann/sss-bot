@@ -1,8 +1,10 @@
-Çalışma Saatleri: Hafta içi 09:00 - 18:00, Cumartesi 10:00 - 15:00. Pazar kapalıdır.
-Hangi Bölgelerde Hizmet Veriyorsunuz?: Van merkez ve yakın ilçelerde servisimiz mevcuttur.
-Acil Servis: 7/24 acil servis hizmetimiz vardır (ek ücret uygulanabilir).
-Servis Ücreti: Standart servis ücreti 300 TL’den başlar.
-Garanti: Yaptığımız tüm tamirlerde 6 ay işçilik garantisi verilmektedir.
-Parça Değişimi: Değiştirilen parçalar 1 yıl garantilidir.
-Ödeme Seçenekleri: Nakit ve banka havalesi kabul edilmektedir.
-İletişim: 05xx xxx xx xx numarasından bize ulaşabilirsiniz.
+kargo: Siparişler 1-3 iş günü içinde kargoya verilir.
+iade: 14 gün içinde koşulsuz iade alıyoruz.
+calisma saatleri: Hafta içi 09:00 - 18:00, Cumartesi 10:00 - 15:00. Pazar kapalıdır.
+bolgeler: Van merkez ve yakın ilçelerde servisimiz mevcuttur.
+acil servis: 7/24 acil servis hizmetimiz vardır (ek ücret uygulanabilir).
+servis ücreti: Standart servis ücreti 300 TL’den başlar.
+garanti: Yaptığımız tüm tamirlerde 6 ay işçilik garantisi verilmektedir.
+parca degisimi: Değiştirilen parçalar 1 yıl garantilidir.
+odeme secenekleri: Nakit ve banka havalesi kabul edilmektedir.
+iletisim: 05xx xxx xx xx numarasından bize ulaşabilirsiniz.
