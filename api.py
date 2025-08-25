@@ -1,58 +1,86 @@
-# api.py — multi-tenant (çok müşterili) SSS Bot + WhatsApp Cloud API webhook
+# api.py — WhatsApp Cloud + FastAPI (temiz sürüm)
+# - Tek bir GET /whatsapp/webhook doğrulaması (hub.challenge döndürür)
+# - POST /whatsapp/webhook mesaj alır, faq.txt'den yanıtlar
+# - .env, CORS, güvenli JSON parse, mutlak faq yolu
+
 import os
 import unicodedata
-import requests
 from pathlib import Path
+from typing import Dict, Optional, List
 
-from fastapi import FastAPI, Request, HTTPException
+import requests
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from fastapi.responses import PlainTextResponse, JSONResponse
 
-app = FastAPI(title="SSS API")
+# .env (yüklüyse)
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
-# ----- CORS -----
+BASE_DIR = Path(__file__).resolve().parent
+if load_dotenv:
+    load_dotenv(BASE_DIR / ".env")
+
+# ---- Env ----
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")
+DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
+app = FastAPI(title="SSS API (clean)")
+
+# ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),  # prod'da domain'lerini yaz
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== Yardımcılar =====
+# ---- Yardımcılar ----
 def norm(s: str) -> str:
-    """Türkçe karakterleri normalize eder, küçük harfe çevirir."""
+    if not isinstance(s, str):
+        s = str(s or "")
     s = s.replace("İ", "I").replace("ı", "i")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s.casefold().strip()
 
-def load_faq(client: str) -> dict[str, str]:
-    """Belirtilen müşterinin faq.txt dosyasını okur."""
-    path = Path(f"data/{client}/faq.txt")
-    out: dict[str, str] = {}
+def load_faq(client: str) -> Dict[str, str]:
+    path = BASE_DIR / "data" / client / "faq.txt"
+    out: Dict[str, str] = {}
     if not path.exists():
         return out
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        out[norm(k)] = v.strip()
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            out[norm(k)] = v.strip()
+    except Exception as e:
+        print("[faq read error]", e)
     return out
 
-def find_any(faq: dict[str, str], keys: list[str]) -> str | None:
-    """faq içinden anahtar kelimeleri bulur."""
+def find_any(faq: Dict[str, str], keys: List[str]) -> Optional[str]:
+    keys_norm = [norm(k) for k in keys]
     for k_norm, val in faq.items():
-        for needle in keys:
-            if needle in k_norm:
+        for needle in keys_norm:
+            if needle and needle in k_norm:
                 return val
     return None
 
 def answer(client: str, question: str) -> str:
-    """Soruya göre cevap döner."""
     faq = load_faq(client)
     s = norm(question)
+
+    if not s or len(s) < 2:
+        topics = ", ".join(sorted(faq.keys())) or "kargo, iade, çalışma saatleri, iletişim, ücret, bölgeler"
+        return f"Merhaba! Yardımcı olabileceğim konular: {topics}\nÖr: 'kargo', 'iade', 'çalışma saatleri'."
 
     if "kargo" in s:
         return "Kargo: " + (find_any(faq, ["kargo"]) or "Bilgi yok.")
@@ -70,28 +98,14 @@ def answer(client: str, question: str) -> str:
         return "Ücret: " + (
             find_any(faq, ["servis ücreti", "ucret", "fiyat"]) or "Bilgi yok."
         )
-    if any(w in s for w in ["bölge", "bolge", "nerelere", "servis alani"]):
+    if any(w in s for w in ["bölge", "bolge", "nerelere", "servis alani", "servis alanı"]):
         return "Hizmet bölgeleri: " + (
-            find_any(
-                faq,
-                [
-                    "hangi bolgelerde hizmet veriyorsunuz",
-                    "bolgeler",
-                    "bölgeler",
-                    "servis bolgesi",
-                ],
-            )
+            find_any(faq, ["hangi bolgelerde hizmet veriyorsunuz", "bolgeler", "bölgeler", "servis bolgesi", "servis bölgesi"])
             or "Bilgi yok."
         )
+    return "Bu bilgi faq.txt içinde yok. 'yardım' veya 'menü' yazabilirsin."
 
-    # if'lerin hiçbiri tetiklenmediyse:
-    return "Bu bilgi faq.txt içinde yok."
-
-# ===== HTTP API =====
-class AskIn(BaseModel):
-    client: str      # ör: "dayi", "musteriA"
-    question: str    # soru
-
+# ---- İç test API ----
 @app.get("/")
 def root():
     return {"message": "SSS Bot API. Test: /docs  |  Soru: POST /ask"}
@@ -100,20 +114,19 @@ def root():
 def health():
     return {"ok": True}
 
+from pydantic import BaseModel
+class AskIn(BaseModel):
+    client: str
+    question: str
+
 @app.post("/ask")
 def ask(inp: AskIn, request: Request):
     return {"answer": answer(inp.client, inp.question)}
 
-# ===== WhatsApp Cloud API entegrasyonu =====
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")          # Meta token
-WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")    # Phone Number ID
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "verify-me")
-DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")       # şimdilik dayı'ya yönlendir
-
-def send_whatsapp_text(to_wa_id: str, text: str):
-    """Gönderene WhatsApp üzerinden metin mesajı yolla."""
+# ---- WhatsApp gönderici ----
+def send_whatsapp_text(to_wa_id: str, text: str) -> None:
     if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID):
-        print("WhatsApp env vars missing")
+        print("[warn] Missing WHATSAPP_TOKEN/WHATSAPP_PHONE_ID")
         return
     url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
@@ -126,55 +139,56 @@ def send_whatsapp_text(to_wa_id: str, text: str):
         "type": "text",
         "text": {"body": text},
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    if r.status_code >= 400:
-        print("WA send error:", r.status_code, r.text)
-
-# 1) Meta doğrulama (hub.* parametre adlarına dikkat)
-@app.get("/whatsapp/webhook")
-def wa_verify(request: Request):
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        return PlainTextResponse(challenge or "")
-    raise HTTPException(status_code=403, detail="verification failed")
-
-# 2) Mesaj alma (Webhook POST)
-@app.post("/whatsapp/webhook")
-async def wa_receive(request: Request):
-    data = await request.json()
     try:
-        entry = data["entry"][0]["changes"][0]["value"]
-        messages = entry.get("messages")
-        if not messages:
-            return {"ok": True}  # status/read vb. olabilir
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code >= 400:
+            print("[WA send error]", r.status_code, r.text)
+    except requests.RequestException as e:
+        print("[WA send exception]", e)
 
-        msg = messages[0]
-        wa_id = msg["from"]                                # gönderen tel (ülke kodlu)
-        text = msg.get("text", {}).get("body", "").strip() # gelen mesaj
-
-        # İleride numara->müşteri eşlemesi yapabiliriz:
-        # NUMBER_TO_CLIENT = {"90555XXXXXXX": "dayi", "90506YYYYYYY": "musteriA"}
-        # client = NUMBER_TO_CLIENT.get(wa_id, DEFAULT_CLIENT)
-        client = DEFAULT_CLIENT
-
-        reply = answer(client, text)
-        send_whatsapp_text(wa_id, reply)
-    except Exception as e:
-        print("WA parse error:", e)
-    return {"ok": True}
-
-from fastapi import Query
-
-VERIFY_TOKEN = "mybotverify"  # Webhook sayfasına yazdığın token ile aynı olmalı
-
+# ---- WhatsApp Webhook: DOĞRULAMA (TEK) ----
 @app.get("/whatsapp/webhook")
 def wa_verify(
     hub_mode: str = Query(..., alias="hub.mode"),
     hub_challenge: str = Query(..., alias="hub.challenge"),
-    hub_verify_token: str = Query(..., alias="hub.verify_token")
+    hub_verify_token: str = Query(..., alias="hub.verify_token"),
 ):
+    # Sadece bu fonksiyon mevcut; duplication yok.
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return int(hub_challenge)
-    return {"error": "Verification failed"}
+        return PlainTextResponse(hub_challenge)  # text/plain
+    raise HTTPException(status_code=403, detail="verification failed")
+
+# ---- WhatsApp Webhook: MESAJ ALMA ----
+@app.post("/whatsapp/webhook")
+async def wa_receive(request: Request):
+    # WhatsApp tekrar denemesin diye 200'ü önceliklendiriyoruz.
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    try:
+        entry = (data.get("entry") or [])
+        if not entry:
+            return {"ok": True}
+        changes = (entry[0].get("changes") or [])
+        if not changes:
+            return {"ok": True}
+        value = changes[0].get("value") or {}
+        messages = value.get("messages")
+        if not messages:
+            return {"ok": True}
+
+        msg = messages[0]
+        wa_id = msg.get("from", "")
+        text = (msg.get("text") or {}).get("body", "")
+        text = (text or "").strip()
+
+        client = DEFAULT_CLIENT  # şimdilik sabit; sonra multi-tenant
+        reply = answer(client, text)
+        if wa_id and reply:
+            send_whatsapp_text(wa_id, reply)
+    except Exception as e:
+        print("[WA parse error]", e)
+
+    return {"ok": True}
