@@ -1,134 +1,169 @@
-# api.py — WhatsApp Cloud + FastAPI (temiz sürüm)
-# - Tek bir GET /whatsapp/webhook doğrulaması (hub.challenge döndürür)
-# - POST /whatsapp/webhook mesaj alır, faq.txt'den yanıtlar
-# - .env, CORS, güvenli JSON parse, mutlak faq yolu
-
+# api.py — WhatsApp Cloud + FastAPI SSS bot (multi-tenant hazır, karşılama + whitelist)
+# Python 3.11+
 import os
+import json
 import unicodedata
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Tuple, Optional
 
 import requests
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 
-# .env (yüklüyse)
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
+# -----------------------------------------------------------------------------
+# FastAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(title="SSS Bot API")
 
-BASE_DIR = Path(__file__).resolve().parent
-if load_dotenv:
-    load_dotenv(BASE_DIR / ".env")
-
-# ---- Env ----
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID", "")
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")
-DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-
-app = FastAPI(title="SSS API (clean)")
-
-# ---- CORS ----
+# ----- CORS -----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Yardımcılar ----
+# -----------------------------------------------------------------------------
+# Ortam değişkenleri
+# -----------------------------------------------------------------------------
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")  # kalıcı token (System User)
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")  # webhook verify
+DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
+# Opsiyonel: phone_number_id -> tenant eşlemesi (JSON string)
+# Örn: {"782459148280075":"dayi","1234567890":"MusteriA"}
+PHONE_TO_CLIENT_JSON = os.getenv("PHONE_TO_CLIENT_JSON", "{}")
+
+# Fallback için tek telefon kimliği de saklayalım (gerekirse buradan göndeririz)
+WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
+
+# -----------------------------------------------------------------------------
+# Yardımcılar
+# -----------------------------------------------------------------------------
 def norm(s: str) -> str:
+    """Türkçe normalize + küçük harf + trim."""
     if not isinstance(s, str):
-        s = str(s or "")
+        return ""
     s = s.replace("İ", "I").replace("ı", "i")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s.casefold().strip()
 
-def load_faq(client: str) -> Dict[str, str]:
-    path = BASE_DIR / "data" / client / "faq.txt"
-    out: Dict[str, str] = {}
+def load_faq(client: str) -> dict[str, str]:
+    """data/<client>/faq.txt -> {anahtar_norm: cevap}"""
+    path = Path(f"data/{client}/faq.txt")
+    out: dict[str, str] = {}
     if not path.exists():
         return out
-    try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or ":" not in line:
-                continue
-            k, v = line.split(":", 1)
-            out[norm(k)] = v.strip()
-    except Exception as e:
-        print("[faq read error]", e)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[norm(k)] = v.strip()
     return out
 
-def find_any(faq: Dict[str, str], keys: List[str]) -> Optional[str]:
-    keys_norm = [norm(k) for k in keys]
+def find_any(faq: dict[str, str], needles: list[str]) -> Optional[str]:
     for k_norm, val in faq.items():
-        for needle in keys_norm:
-            if needle and needle in k_norm:
+        for needle in needles:
+            if needle in k_norm:
                 return val
     return None
 
 def answer(client: str, question: str) -> str:
+    """Basit SSS eşleştirici (intent anahtar kelimeleri + faq.txt lookup)."""
     faq = load_faq(client)
     s = norm(question)
-
-    if not s or len(s) < 2:
-        topics = ", ".join(sorted(faq.keys())) or "kargo, iade, çalışma saatleri, iletişim, ücret, bölgeler"
-        return f"Merhaba! Yardımcı olabileceğim konular: {topics}\nÖr: 'kargo', 'iade', 'çalışma saatleri'."
 
     if "kargo" in s:
         return "Kargo: " + (find_any(faq, ["kargo"]) or "Bilgi yok.")
     if "iade" in s:
         return "İade: " + (find_any(faq, ["iade"]) or "Bilgi yok.")
-    if any(w in s for w in ["saat", "acik", "açik", "calisma", "çalisma"]):
+    if any(w in s for w in ["saat", "acik", "açik", "acık", "calisma", "çalisma", "çalışma"]):
         return "Çalışma saatleri: " + (
             find_any(faq, ["calisma saatleri", "saatler", "saat"]) or "Bilgi yok."
         )
     if any(w in s for w in ["iletisim", "iletişim", "mail", "e posta", "e-posta"]):
-        return "İletişim: " + (find_any(faq, ["iletisim"]) or "Bilgi yok.")
+        return "İletişim: " + (find_any(faq, ["iletisim", "telefon"]) or "Bilgi yok.")
     if "garanti" in s:
         return "Garanti: " + (find_any(faq, ["garanti"]) or "Bilgi yok.")
     if any(w in s for w in ["ucret", "ücret", "fiyat"]):
         return "Ücret: " + (
-            find_any(faq, ["servis ücreti", "ucret", "fiyat"]) or "Bilgi yok."
+            find_any(faq, ["servis ücreti", "ucret", "ücret", "fiyat"]) or "Bilgi yok."
         )
     if any(w in s for w in ["bölge", "bolge", "nerelere", "servis alani", "servis alanı"]):
         return "Hizmet bölgeleri: " + (
-            find_any(faq, ["hangi bolgelerde hizmet veriyorsunuz", "bolgeler", "bölgeler", "servis bolgesi", "servis bölgesi"])
+            find_any(
+                faq,
+                [
+                    "hangi bolgelerde hizmet veriyorsunuz",
+                    "bolgeler",
+                    "bölgeler",
+                    "servis bolgesi",
+                    "servis alanı",
+                ],
+            )
             or "Bilgi yok."
         )
-    return "Bu bilgi faq.txt içinde yok. 'yardım' veya 'menü' yazabilirsin."
+    return "Bu bilgi faq.txt içinde yok."
 
-# ---- İç test API ----
-@app.get("/")
-def root():
-    return {"message": "SSS Bot API. Test: /docs  |  Soru: POST /ask"}
+# ---- Tenant config (karşılama + whitelist intents) ----
+def load_tenant_cfg(client: str) -> dict:
+    cfg_path = Path(f"data/{client}/config.json")
+    if cfg_path.exists():
+        try:
+            return json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # varsayılan
+    return {
+        "greeting": "Hoş geldiniz! Yardım için 'menü' yazın.",
+        "auto_intents": [],
+        "cooldown_minutes": 120,
+    }
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+def list_menu_text(client: str) -> str:
+    cfg = load_tenant_cfg(client)
+    items = cfg.get("auto_intents", [])
+    if not items:
+        return "Şu an hızlı cevap verebildiğim özel konu yok."
+    bullets = "\n".join(f"- {x}" for x in items)
+    return f"Aşağıdaki konularda anında yardımcı olabilirim:\n{bullets}"
 
-from pydantic import BaseModel
-class AskIn(BaseModel):
-    client: str
-    question: str
+def is_help_like(s: str) -> bool:
+    return s in {"yardim", "yardım", "menu", "menü", "liste"}
 
-@app.post("/ask")
-def ask(inp: AskIn, request: Request):
-    return {"answer": answer(inp.client, inp.question)}
+# ---- Basit durum saklama (RAM) ----
+SESSIONS: Dict[Tuple[str, str], dict] = {}   # (client, wa_id) -> {greeted_at: dt}
+PROCESSED_MSG_IDS: set[str] = set()          # idempotency
 
-# ---- WhatsApp gönderici ----
-def send_whatsapp_text(to_wa_id: str, text: str) -> None:
-    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID):
-        print("[warn] Missing WHATSAPP_TOKEN/WHATSAPP_PHONE_ID")
+# ---- Tenant çözümleme ----
+def resolve_client(phone_number_id: Optional[str]) -> str:
+    """phone_number_id -> tenant, yoksa DEFAULT_CLIENT."""
+    try:
+        mapping = json.loads(PHONE_TO_CLIENT_JSON or "{}")
+        if phone_number_id and phone_number_id in mapping:
+            return mapping[phone_number_id]
+    except Exception:
+        pass
+    return DEFAULT_CLIENT
+
+# -----------------------------------------------------------------------------
+# WhatsApp gönderim
+# -----------------------------------------------------------------------------
+def send_whatsapp_text(phone_number_id: Optional[str], to_wa_id: str, text: str):
+    """Meta Graph send API (v20). Gelen event'teki phone_number_id varsa onu kullan."""
+    if not WHATSAPP_TOKEN:
+        print("[WA] missing WHATSAPP_TOKEN")
         return
-    url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+    phone_id = phone_number_id or WHATSAPP_PHONE_ID_FALLBACK
+    if not phone_id:
+        print("[WA] phone_number_id missing")
+        return
+
+    url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
@@ -143,52 +178,101 @@ def send_whatsapp_text(to_wa_id: str, text: str) -> None:
         r = requests.post(url, headers=headers, json=payload, timeout=30)
         if r.status_code >= 400:
             print("[WA send error]", r.status_code, r.text)
-    except requests.RequestException as e:
-        print("[WA send exception]", e)
+    except Exception as e:
+        print("[WA send error]", e)
 
-# ---- WhatsApp Webhook: DOĞRULAMA (TEK) ----
+# -----------------------------------------------------------------------------
+# HTTP API (test)
+# -----------------------------------------------------------------------------
+class AskIn(BaseModel):
+    client: str
+    question: str
+
+@app.get("/")
+def root():
+    return {"message": "SSS Bot API. Test: /docs  |  Soru: POST /ask"}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/ask")
+def ask(inp: AskIn, request: Request):
+    return {"answer": answer(inp.client, inp.question)}
+
+# -----------------------------------------------------------------------------
+# WhatsApp Webhook
+# -----------------------------------------------------------------------------
+# 1) GET verify
 @app.get("/whatsapp/webhook")
 def wa_verify(
     hub_mode: str = Query(..., alias="hub.mode"),
     hub_challenge: str = Query(..., alias="hub.challenge"),
     hub_verify_token: str = Query(..., alias="hub.verify_token"),
 ):
-    # Sadece bu fonksiyon mevcut; duplication yok.
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return PlainTextResponse(hub_challenge)  # text/plain
+        return PlainTextResponse(hub_challenge)
     raise HTTPException(status_code=403, detail="verification failed")
 
-# ---- WhatsApp Webhook: MESAJ ALMA ----
+# 2) POST receive
 @app.post("/whatsapp/webhook")
 async def wa_receive(request: Request):
-    # WhatsApp tekrar denemesin diye 200'ü önceliklendiriyoruz.
+    data = await request.json()
     try:
-        data = await request.json()
-    except Exception:
-        return {"ok": True}
-
-    try:
-        entry = (data.get("entry") or [])
-        if not entry:
-            return {"ok": True}
-        changes = (entry[0].get("changes") or [])
-        if not changes:
-            return {"ok": True}
-        value = changes[0].get("value") or {}
-        messages = value.get("messages")
+        entry = data["entry"][0]["changes"][0]["value"]
+        messages = entry.get("messages")
         if not messages:
             return {"ok": True}
 
         msg = messages[0]
-        wa_id = msg.get("from", "")
-        text = (msg.get("text") or {}).get("body", "")
-        text = (text or "").strip()
+        msg_id = msg.get("id")
+        if msg_id and msg_id in PROCESSED_MSG_IDS:
+            return {"ok": True}
+        if msg_id:
+            PROCESSED_MSG_IDS.add(msg_id)
 
-        client = DEFAULT_CLIENT  # şimdilik sabit; sonra multi-tenant
-        reply = answer(client, text)
-        if wa_id and reply:
-            send_whatsapp_text(wa_id, reply)
+        wa_id = msg["from"]                           # kullanıcı numarası
+        text = msg.get("text", {}).get("body", "").strip()
+        phone_number_id = entry.get("metadata", {}).get("phone_number_id")
+
+        # Tenant belirle
+        client = resolve_client(phone_number_id)
+        cfg = load_tenant_cfg(client)
+        auto_intents_norm = [norm(x) for x in cfg.get("auto_intents", [])]
+        s = norm(text)
+        now = datetime.utcnow()
+
+        # menü/yardım
+        if is_help_like(s):
+            send_whatsapp_text(phone_number_id, wa_id, list_menu_text(client))
+            return {"ok": True}
+
+        # karşılama (ilk mesaj veya cooldown dolmuşsa)
+        sess_key = (client, wa_id)
+        sess = SESSIONS.get(sess_key)
+        cooldown = int(cfg.get("cooldown_minutes", 120))
+        need_greet = False
+        if not sess:
+            need_greet = True
+        else:
+            last = sess.get("greeted_at")
+            if not last or (now - last) > timedelta(minutes=cooldown):
+                need_greet = True
+
+        if need_greet:
+            SESSIONS[sess_key] = {"greeted_at": now}
+            send_whatsapp_text(phone_number_id, wa_id, cfg.get("greeting", "Hoş geldiniz!"))
+            return {"ok": True}  # sadece karşılama gönder
+
+        # sadece whitelist'teki konulara cevap ver
+        if any(k in s for k in auto_intents_norm):
+            reply = answer(client, text)
+            send_whatsapp_text(phone_number_id, wa_id, reply)
+            return {"ok": True}
+
+        # izinli değilse sessiz kal
+        return {"ok": True}
+
     except Exception as e:
         print("[WA parse error]", e)
-
-    return {"ok": True}
+        return {"ok": True}
