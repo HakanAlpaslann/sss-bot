@@ -1,5 +1,7 @@
-# api.py — WhatsApp Cloud + FastAPI SSS bot (multi-tenant hazır, karşılama + whitelist)
+# api.py — WhatsApp Cloud + FastAPI SSS bot
+# Özellikler: karşılama+menü tek mesajda, whitelist auto-intents, sessiz mod, multi-tenant hazır
 # Python 3.11+
+
 import os
 import json
 import unicodedata
@@ -29,18 +31,18 @@ app.add_middleware(
 # -----------------------------------------------------------------------------
 # Ortam değişkenleri
 # -----------------------------------------------------------------------------
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")  # kalıcı token (System User)
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")  # webhook verify
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")  # System User ile alınmış kalıcı token
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")  # webhook doğrulama tokenı
 DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
-# Opsiyonel: phone_number_id -> tenant eşlemesi (JSON string)
-# Örn: {"782459148280075":"dayi","1234567890":"MusteriA"}
+
+# Çok müşterili eşleme (opsiyonel): {"phone_number_id":"tenant", ...}
 PHONE_TO_CLIENT_JSON = os.getenv("PHONE_TO_CLIENT_JSON", "{}")
 
-# Fallback için tek telefon kimliği de saklayalım (gerekirse buradan göndeririz)
+# Fallback phone id (opsiyonel): eventte gelmezse buradan alır
 WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
 
 # -----------------------------------------------------------------------------
-# Yardımcılar
+# Yardımcılar (normalize, faq yükleme, cevap)
 # -----------------------------------------------------------------------------
 def norm(s: str) -> str:
     """Türkçe normalize + küçük harf + trim."""
@@ -109,7 +111,9 @@ def answer(client: str, question: str) -> str:
         )
     return "Bu bilgi faq.txt içinde yok."
 
-# ---- Tenant config (karşılama + whitelist intents) ----
+# -----------------------------------------------------------------------------
+# Tenant config (karşılama + whitelist)
+# -----------------------------------------------------------------------------
 def load_tenant_cfg(client: str) -> dict:
     cfg_path = Path(f"data/{client}/config.json")
     if cfg_path.exists():
@@ -117,11 +121,13 @@ def load_tenant_cfg(client: str) -> dict:
             return json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    # varsayılan
+    # Varsayılan ayarlar
     return {
         "greeting": "Hoş geldiniz! Yardım için 'menü' yazın.",
         "auto_intents": [],
         "cooldown_minutes": 120,
+        "append_menu_to_greeting": True,  # karşılama altına menü ekle
+        "help_enabled": True,             # menü/yardım komutunu aç/kapa
     }
 
 def list_menu_text(client: str) -> str:
@@ -135,11 +141,15 @@ def list_menu_text(client: str) -> str:
 def is_help_like(s: str) -> bool:
     return s in {"yardim", "yardım", "menu", "menü", "liste"}
 
-# ---- Basit durum saklama (RAM) ----
+# -----------------------------------------------------------------------------
+# Basit durum saklama (RAM)
+# -----------------------------------------------------------------------------
 SESSIONS: Dict[Tuple[str, str], dict] = {}   # (client, wa_id) -> {greeted_at: dt}
 PROCESSED_MSG_IDS: set[str] = set()          # idempotency
 
-# ---- Tenant çözümleme ----
+# -----------------------------------------------------------------------------
+# Tenant çözümleme
+# -----------------------------------------------------------------------------
 def resolve_client(phone_number_id: Optional[str]) -> str:
     """phone_number_id -> tenant, yoksa DEFAULT_CLIENT."""
     try:
@@ -182,7 +192,7 @@ def send_whatsapp_text(phone_number_id: Optional[str], to_wa_id: str, text: str)
         print("[WA send error]", e)
 
 # -----------------------------------------------------------------------------
-# HTTP API (test)
+# HTTP API (test amaçlı)
 # -----------------------------------------------------------------------------
 class AskIn(BaseModel):
     client: str
@@ -225,25 +235,27 @@ async def wa_receive(request: Request):
             return {"ok": True}
 
         msg = messages[0]
+
+        # idempotency
         msg_id = msg.get("id")
         if msg_id and msg_id in PROCESSED_MSG_IDS:
             return {"ok": True}
         if msg_id:
             PROCESSED_MSG_IDS.add(msg_id)
 
-        wa_id = msg["from"]                           # kullanıcı numarası
+        wa_id = msg["from"]                           # kullanıcının WA numarası
         text = msg.get("text", {}).get("body", "").strip()
         phone_number_id = entry.get("metadata", {}).get("phone_number_id")
 
-        # Tenant belirle
+        # tenant belirle
         client = resolve_client(phone_number_id)
         cfg = load_tenant_cfg(client)
         auto_intents_norm = [norm(x) for x in cfg.get("auto_intents", [])]
         s = norm(text)
         now = datetime.utcnow()
 
-        # menü/yardım
-        if is_help_like(s):
+        # menü/yardım komutu (ayar açıksa)
+        if cfg.get("help_enabled", True) and is_help_like(s):
             send_whatsapp_text(phone_number_id, wa_id, list_menu_text(client))
             return {"ok": True}
 
@@ -261,7 +273,10 @@ async def wa_receive(request: Request):
 
         if need_greet:
             SESSIONS[sess_key] = {"greeted_at": now}
-            send_whatsapp_text(phone_number_id, wa_id, cfg.get("greeting", "Hoş geldiniz!"))
+            greet = cfg.get("greeting", "Hoş geldiniz!")
+            if cfg.get("append_menu_to_greeting", True):
+                greet = f"{greet}\n\n{list_menu_text(client)}"
+            send_whatsapp_text(phone_number_id, wa_id, greet)
             return {"ok": True}  # sadece karşılama gönder
 
         # sadece whitelist'teki konulara cevap ver
