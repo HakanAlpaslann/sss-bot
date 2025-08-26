@@ -6,8 +6,8 @@
 # - Fuzzy fallback (rapidfuzz)
 # - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
 # - Arka planda gönderim + 429/5xx backoff
-# - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
-# - Admin: reset, hot-reload, stats (ARTIK Bearer token ile korumalı)
+# - Multi-tenant hazır (PHONE_TO_CLIENT_JSON + IG_TO_CLIENT_JSON)
+# - Admin: reset, hot-reload, stats (Bearer token ile korumalı)
 # - Hot-reload: faq/config mtime cache + /admin/reload-faq
 # - Redis (opsiyonel): session + idempotency + basit istatistik kalıcı
 
@@ -30,11 +30,11 @@ from fastapi import (
     Query,
     Header,
     BackgroundTasks,
-    Depends,  # 👈 eklendi
+    Depends,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer  # 👈 eklendi
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 # --- (opsiyonel) bulanık eşleştirme ---
@@ -77,7 +77,16 @@ WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
 APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama)
 REDIS_URL = os.getenv("REDIS_URL", "")
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # 👈 admin koruması için
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+# --- Instagram ENV ---
+IG_VERIFY_TOKEN = os.getenv("IG_VERIFY_TOKEN", "")
+IG_PAGE_TOKEN = os.getenv("IG_PAGE_TOKEN", "")
+IG_TO_CLIENT_JSON = os.getenv("IG_TO_CLIENT_JSON", "{}")
+try:
+    IG_TO_CLIENT = json.loads(IG_TO_CLIENT_JSON) if IG_TO_CLIENT_JSON else {}
+except Exception:
+    IG_TO_CLIENT = {}
 
 # -----------------------------------------------------------------------------
 # Admin auth (Bearer)
@@ -85,7 +94,6 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # 👈 admin koruması için
 auth_scheme = HTTPBearer(auto_error=False)
 
 def require_admin(creds: HTTPAuthorizationCredentials = Depends(auth_scheme)):
-    # ADMIN_TOKEN tanımlıysa Bearer zorunlu; tanımlı değilse korumayı devre dışı bırak.
     if not ADMIN_TOKEN:
         return True
     if not creds or not creds.credentials or (creds.scheme or "").lower() != "bearer":
@@ -293,27 +301,27 @@ def fuzzy_find(faq: dict[str, str], user_text_norm: str, threshold: int = 85) ->
 # -----------------------------------------------------------------------------
 # Kalıcılık sarmalayıcıları (Redis + RAM fallback)
 # -----------------------------------------------------------------------------
-SESSIONS: Dict[Tuple[str, str], dict] = {}   # RAM
-PROCESSED_MSG_IDS: set[str] = set()          # RAM
-STATS_MEM: Dict[str, Dict[str, int]] = {}    # RAM: tenant -> {greeting, menu, faq}
+SESSIONS: Dict[Tuple[str, str], dict] = {}
+PROCESSED_MSG_IDS: set[str] = set()
+STATS_MEM: Dict[str, Dict[str, int]] = {}
 
-def get_session(client: str, wa_id: str) -> Optional[dict]:
-    key = f"session:{client}:{wa_id}"
+def get_session(client: str, user_id: str) -> Optional[dict]:
+    key = f"session:{client}:{user_id}"
     r_sess = r_get_json(key)
     if r_sess is not None:
         return r_sess
-    return SESSIONS.get((client, wa_id))
+    return SESSIONS.get((client, user_id))
 
-def set_session(client: str, wa_id: str, data: dict):
-    key = f"session:{client}:{wa_id}"
-    r_set_json(key, data, ttl_sec=60*60*24*30)  # 30 gün
-    SESSIONS[(client, wa_id)] = data
+def set_session(client: str, user_id: str, data: dict):
+    key = f"session:{client}:{user_id}"
+    r_set_json(key, data, ttl_sec=60*60*24*30)
+    SESSIONS[(client, user_id)] = data
 
-def del_session(client: str, wa_id: str):
-    key = f"session:{client}:{wa_id}"
+def del_session(client: str, user_id: str):
+    key = f"session:{client}:{user_id}"
     r_del(key)
-    if (client, wa_id) in SESSIONS:
-        del SESSIONS[(client, wa_id)]
+    if (client, user_id) in SESSIONS:
+        del SESSIONS[(client, user_id)]
 
 def was_processed(msg_id: Optional[str]) -> bool:
     if not msg_id:
@@ -321,7 +329,7 @@ def was_processed(msg_id: Optional[str]) -> bool:
     key = f"msgid:{msg_id}"
     if r_exists(key):
         return True
-    r_set_flag(key, ttl_sec=60*60*24*3)  # 3 gün
+    r_set_flag(key, ttl_sec=60*60*24*3)
     if msg_id in PROCESSED_MSG_IDS:
         return True
     PROCESSED_MSG_IDS.add(msg_id)
@@ -330,7 +338,6 @@ def was_processed(msg_id: Optional[str]) -> bool:
 def inc_stat(tenant: str, kind: str):
     r_sadd("stats:tenants", tenant)
     r_hincr(f"stats:{tenant}", kind, 1)
-    # RAM fallback
     t = STATS_MEM.setdefault(tenant, {})
     t[kind] = t.get(kind, 0) + 1
 
@@ -340,10 +347,8 @@ def read_stats() -> dict:
     if tenants:
         for t in tenants:
             out[t] = r_hgetall(f"stats:{t}")
-    # RAM fallback (Redis yoksa)
     if not out:
         out = STATS_MEM
-    # int'e çevir
     for t, kv in list(out.items()):
         out[t] = {k: int(v) for k, v in kv.items()}
     return out
@@ -386,7 +391,6 @@ def answer(client: str, question: str) -> str:
             or "Bilgi yok."
         )
 
-    # Fuzzy fallback
     try:
         cfg = load_tenant_cfg(client)
         threshold = int(cfg.get("fuzzy_threshold", 85))
@@ -423,6 +427,11 @@ def resolve_client(phone_number_id: Optional[str]) -> str:
     except Exception:
         pass
     return DEFAULT_CLIENT
+
+def resolve_ig_client(page_or_ig_user_id: Optional[str]) -> str:
+    if not page_or_ig_user_id:
+        return DEFAULT_CLIENT
+    return IG_TO_CLIENT.get(str(page_or_ig_user_id)) or DEFAULT_CLIENT
 
 # -----------------------------------------------------------------------------
 # İmza doğrulama (X-Hub-Signature-256)
@@ -476,6 +485,36 @@ def send_whatsapp_text(phone_number_id: Optional[str], to_wa_id: str, text: str)
             time.sleep(wait)
 
 # -----------------------------------------------------------------------------
+# Instagram gönderim (retry/backoff'lu)
+# -----------------------------------------------------------------------------
+def send_ig_text(ig_user_id: str, recipient_psid: str, text: str):
+    if not IG_PAGE_TOKEN:
+        print("[IG] missing IG_PAGE_TOKEN"); return
+    if not ig_user_id:
+        print("[IG] missing ig_user_id"); return
+
+    url = f"https://graph.facebook.com/v20.0/{ig_user_id}/messages"
+    params = {"access_token": IG_PAGE_TOKEN}
+    payload = {"recipient": {"id": recipient_psid}, "message": {"text": text}}
+
+    for attempt in range(3):
+        try:
+            r = requests.post(url, params=params, json=payload, timeout=30)
+            if r.status_code < 400:
+                return
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 2 ** attempt
+                print(f"[IG backoff] {r.status_code} attempt={attempt+1} wait={wait}s {r.text}")
+                time.sleep(wait)
+                continue
+            print("[IG send error]", r.status_code, r.text)
+            return
+        except Exception as e:
+            wait = 2 ** attempt
+            print("[IG send error]", e, f"attempt={attempt+1} wait={wait}s")
+            time.sleep(wait)
+
+# -----------------------------------------------------------------------------
 # HTTP API (test & admin)
 # -----------------------------------------------------------------------------
 class AskIn(BaseModel):
@@ -484,11 +523,11 @@ class AskIn(BaseModel):
 
 class ResetIn(BaseModel):
     client: str
-    wa_id: str  # +90 ile başlayan kullanıcı numarası
+    wa_id: str  # kullanıcı id (WA: tel, IG: psid)
 
 class ReloadIn(BaseModel):
-    client: Optional[str] = None      # belirtilirse tek tenant, boşsa hepsi
-    what: str = "all"                 # "faq" | "config" | "all"
+    client: Optional[str] = None
+    what: str = "all"  # "faq" | "config" | "all"
 
 @app.get("/")
 def root():
@@ -502,17 +541,17 @@ def health():
 def ask(inp: AskIn, request: Request):
     return {"answer": answer(inp.client, inp.question)}
 
-@app.post("/admin/reset-session", dependencies=[Depends(require_admin)])  # 👈 korumalı
+@app.post("/admin/reset-session", dependencies=[Depends(require_admin)])
 def reset_session(inp: ResetIn):
     del_session(inp.client, inp.wa_id)
     return {"ok": True}
 
-@app.post("/admin/reset-all-sessions", dependencies=[Depends(require_admin)])  # 👈 korumalı
+@app.post("/admin/reset-all-sessions", dependencies=[Depends(require_admin)])
 def reset_all_sessions():
     SESSIONS.clear()
     return {"ok": True, "cleared_ram": True, "note": "Redis oturumları TTL ile kendiliğinden düşer."}
 
-@app.post("/admin/reload-faq", dependencies=[Depends(require_admin)])  # 👈 korumalı
+@app.post("/admin/reload-faq", dependencies=[Depends(require_admin)])
 def reload_faq(inp: ReloadIn):
     if inp.client:
         if inp.what in ("faq", "all"):
@@ -528,15 +567,13 @@ def reload_faq(inp: ReloadIn):
         scope = "all"
     return {"ok": True, "reloaded": inp.what, "scope": scope}
 
-@app.get("/admin/stats", dependencies=[Depends(require_admin)])  # 👈 korumalı
+@app.get("/admin/stats", dependencies=[Depends(require_admin)])
 def stats():
-    """Basit istatistikler (tenant bazında greeting/menu/faq sayıları)."""
     return {"ok": True, "stats": read_stats()}
 
 # -----------------------------------------------------------------------------
 # WhatsApp Webhook
 # -----------------------------------------------------------------------------
-# 1) GET verify
 @app.get("/whatsapp/webhook")
 def wa_verify(
     hub_mode: str = Query(..., alias="hub.mode"),
@@ -547,14 +584,12 @@ def wa_verify(
         return PlainTextResponse(hub_challenge)
     raise HTTPException(status_code=403, detail="verification failed")
 
-# 2) POST receive
 @app.post("/whatsapp/webhook")
 async def wa_receive(
     request: Request,
     background_tasks: BackgroundTasks,
     x_hub_signature_256: Optional[str] = Header(default=None, alias="X-Hub-Signature-256"),
 ):
-    # --- imza doğrulama ---
     raw = await request.body()
     if not verify_signature(APP_SECRET, raw, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="bad signature")
@@ -568,30 +603,26 @@ async def wa_receive(
 
         msg = messages[0]
 
-        # idempotency
         msg_id = msg.get("id")
         if was_processed(msg_id):
             return {"ok": True}
 
-        wa_id = msg["from"]  # kullanıcının WhatsApp numarası
+        wa_id = msg["from"]
         text = msg.get("text", {}).get("body", "").strip()
         phone_number_id = entry.get("metadata", {}).get("phone_number_id")
 
-        # tenant
         client = resolve_client(phone_number_id)
         cfg = load_tenant_cfg(client)
         auto_intents_norm = [norm(x) for x in cfg.get("auto_intents", [])]
         s = norm(text)
         now = datetime.utcnow()
 
-        # menü/yardım (senin config'inde help_enabled=false, yani sessiz kalır)
         if cfg.get("help_enabled", True) and is_help_like(s):
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, list_menu_text(client))
             inc_stat(client, "menu")
-            logger.info(json.dumps({"evt":"reply","type":"menu","tenant":client,"wa":wa_id[-4:]}))
+            logger.info(json.dumps({"evt":"reply","chan":"wa","type":"menu","tenant":client,"id":wa_id[-4:]}))
             return {"ok": True}
 
-        # karşılama (ilk mesaj veya cooldown dolmuşsa)
         sess = get_session(client, wa_id)
         cooldown = int(cfg.get("cooldown_minutes", 120))
         need_greet = False
@@ -610,10 +641,9 @@ async def wa_receive(
                 greet = f"{greet}\n\n{list_menu_text(client)}"
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, greet)
             inc_stat(client, "greeting")
-            logger.info(json.dumps({"evt":"reply","type":"greeting","tenant":client,"wa":wa_id[-4:]}))
+            logger.info(json.dumps({"evt":"reply","chan":"wa","type":"greeting","tenant":client,"id":wa_id[-4:]}))
             return {"ok": True}
 
-        # sadece whitelist'teki konulara cevap ver (küçük fuzzy toleranslı)
         allowed = any(k in s for k in auto_intents_norm)
         if not allowed and fuzz:
             for k in auto_intents_norm:
@@ -628,12 +658,153 @@ async def wa_receive(
             reply = answer(client, text)
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, reply)
             inc_stat(client, "faq")
-            logger.info(json.dumps({"evt":"reply","type":"faq","tenant":client,"wa":wa_id[-4:], "q": s[:80]}))
+            logger.info(json.dumps({"evt":"reply","chan":"wa","type":"faq","tenant":client,"id":wa_id[-4:], "q": s[:80]}))
             return {"ok": True}
 
-        # izinli değilse sessiz kal
         return {"ok": True}
 
     except Exception as e:
         print("[WA parse error]", e)
         return {"ok": True}
+
+# -----------------------------------------------------------------------------
+# Instagram Webhook
+# -----------------------------------------------------------------------------
+@app.get("/instagram/webhook")
+def ig_verify(
+    hub_mode: str = Query(..., alias="hub.mode"),
+    hub_challenge: str = Query(..., alias="hub.challenge"),
+    hub_verify_token: str = Query(..., alias="hub.verify_token"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == IG_VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge)
+    raise HTTPException(status_code=403, detail="verification failed")
+
+def _iter_ig_text_messages(entry: dict):
+    """
+    IG webhook farklı formatlarla gelebilir. Aşağıdaki senaryolar desteklenir:
+    - entry["messaging"] listesi (sender.id, recipient.id, message.text)
+    - entry["standby"] listesi (benzer yapı — bazı modlarda)
+    Dönen her kayıt: (ig_user_id, sender_psid, text, mid)
+    """
+    ig_user_id = entry.get("id")  # sayfa/ig_user id (messages endpoint path)
+    # 1) messaging
+    for ev in entry.get("messaging", []) or []:
+        sender_psid = (ev.get("sender") or {}).get("id")
+        message = ev.get("message") or {}
+        mid = message.get("mid") or ev.get("mid")
+        text = None
+        if isinstance(message.get("text"), str):
+            text = message.get("text")
+        elif isinstance(message.get("text"), dict):
+            text = (message.get("text") or {}).get("body")
+        if sender_psid and text:
+            yield (ig_user_id, sender_psid, text.strip(), mid)
+
+    # 2) standby (yedek mod)
+    for ev in entry.get("standby", []) or []:
+        sender_psid = (ev.get("sender") or {}).get("id")
+        message = ev.get("message") or {}
+        mid = message.get("mid") or ev.get("mid")
+        text = None
+        if isinstance(message.get("text"), str):
+            text = message.get("text")
+        elif isinstance(message.get("text"), dict):
+            text = (message.get("text") or {}).get("body")
+        if sender_psid and text:
+            yield (ig_user_id, sender_psid, text.strip(), mid)
+
+@app.post("/instagram/webhook")
+async def ig_receive(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_hub_signature_256: Optional[str] = Header(default=None, alias="X-Hub-Signature-256"),
+):
+    raw = await request.body()
+    if not verify_signature(APP_SECRET, raw, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="bad signature")
+
+    payload = json.loads(raw.decode("utf-8") or "{}")
+    try:
+        entries = payload.get("entry") or []
+        if not entries:
+            return {"ok": True}
+
+        # Meta IG webhookları birden fazla entry/ değişiklik içerebilir
+        for ent in entries:
+            # Bazı setuplarda IG değişiklikleri "changes[].value" yerine doğrudan entry içinde olabilir
+            if "changes" in ent:
+                for ch in ent.get("changes") or []:
+                    val = ch.get("value") or {}
+                    for ig_user_id, sender_psid, text, mid in _iter_ig_text_messages(val):
+                        if mid and was_processed(mid):
+                            continue
+                        await _handle_ig_text(background_tasks, ig_user_id, sender_psid, text)
+                continue
+
+            # Değişiklik yoksa doğrudan entry'den dene
+            for ig_user_id, sender_psid, text, mid in _iter_ig_text_messages(ent):
+                if mid and was_processed(mid):
+                    continue
+                await _handle_ig_text(background_tasks, ig_user_id, sender_psid, text)
+
+        return {"ok": True}
+
+    except Exception as e:
+        print("[IG parse error]", e)
+        return {"ok": True}
+
+async def _handle_ig_text(background_tasks: BackgroundTasks, ig_user_id: str, sender_psid: str, text: str):
+    client = resolve_ig_client(ig_user_id)
+    cfg = load_tenant_cfg(client)
+    auto_intents_norm = [norm(x) for x in cfg.get("auto_intents", [])]
+    s = norm(text)
+    now = datetime.utcnow()
+
+    # yardım/menü
+    if cfg.get("help_enabled", True) and is_help_like(s):
+        background_tasks.add_task(send_ig_text, ig_user_id, sender_psid, list_menu_text(client))
+        inc_stat(client, "menu")
+        logger.info(json.dumps({"evt":"reply","chan":"ig","type":"menu","tenant":client,"id":sender_psid[-4:]}))
+        return
+
+    # karşılama (cooldown)
+    sess = get_session(client, sender_psid)
+    cooldown = int(cfg.get("cooldown_minutes", 120))
+    need_greet = False
+    if not sess:
+        need_greet = True
+    else:
+        last_iso = sess.get("greeted_at")
+        last = datetime.fromisoformat(last_iso) if last_iso else None
+        if (not last) or (now - last) > timedelta(minutes=cooldown):
+            need_greet = True
+
+    if need_greet:
+        set_session(client, sender_psid, {"greeted_at": now.isoformat()})
+        greet = cfg.get("greeting", "Hoş geldiniz!")
+        if cfg.get("append_menu_to_greeting", True):
+            greet = f"{greet}\n\n{list_menu_text(client)}"
+        background_tasks.add_task(send_ig_text, ig_user_id, sender_psid, greet)
+        inc_stat(client, "greeting")
+        logger.info(json.dumps({"evt":"reply","chan":"ig","type":"greeting","tenant":client,"id":sender_psid[-4:]}))
+        return
+
+    # whitelist kontrol + hafif fuzzy
+    allowed = any(k in s for k in auto_intents_norm)
+    if not allowed and fuzz:
+        for k in auto_intents_norm:
+            try:
+                if fuzz.partial_ratio(s, k) >= 80:
+                    allowed = True
+                    break
+            except Exception:
+                pass
+
+    if allowed:
+        reply = answer(client, text)
+        background_tasks.add_task(send_ig_text, ig_user_id, sender_psid, reply)
+        inc_stat(client, "faq")
+        logger.info(json.dumps({"evt":"reply","chan":"ig","type":"faq","tenant":client,"id":sender_psid[-4:], "q": s[:80]}))
+        return
+    # izinli değilse sessiz
