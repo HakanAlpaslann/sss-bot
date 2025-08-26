@@ -1,7 +1,8 @@
 {
   "greeting": "Hoş geldiniz! 👋",
-  "auto_intents": ["çalışma saatleri", "ücret", "garanti", "iletişim", "bölge"],
-  "cooldown_minutes": 120,
+  "auto_intents": ["saat", "ücret", "garanti", "iletişim", "bölge", "kargo", "iade"],
+  "cooldown_minutes": 1440,
   "append_menu_to_greeting": true,
-  "help_enabled": false
+  "help_enabled": false,
+  "fuzzy_threshold": 85
 }
