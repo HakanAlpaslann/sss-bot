@@ -1,15 +1,15 @@
-# api.py — WhatsApp Cloud + FastAPI SSS bot (hot-reload sürümü)
+# api.py — WhatsApp Cloud + FastAPI SSS bot (hot-reload + Redis sürümü)
 # Python 3.11+
 # Özellikler:
 # - İlk mesajda karşılama + menü (config ile)
-# - Sonrasında sadece auto_intents -> cevap, diğer tüm mesajlara sessiz
-# - Fuzzy fallback (rapidfuzz) ile yazım hatalarında doğru cevabı bulma
+# - Sonrasında sadece auto_intents -> cevap; diğer mesajlara sessiz
+# - Fuzzy fallback (rapidfuzz)
 # - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
 # - Arka planda gönderim + 429/5xx backoff
 # - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
-# - Admin reset + hot-reload endpoint'leri
-# - Yapılandırılmış log
-# - Seviye 1 hot-reload: faq/config diskten okuma mtime-cache + /admin/reload-faq
+# - Admin: reset, hot-reload, stats
+# - Hot-reload: faq/config mtime cache + /admin/reload-faq
+# - Redis (opsiyonel): session + idempotency + basit istatistik kalıcı
 
 import os
 import json
@@ -41,6 +41,12 @@ try:
 except Exception:
     fuzz = None
 
+# --- (opsiyonel) Redis ---
+try:
+    from redis import Redis  # pip install redis
+except Exception:
+    Redis = None
+
 # -----------------------------------------------------------------------------
 # FastAPI & CORS
 # -----------------------------------------------------------------------------
@@ -67,11 +73,121 @@ DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
 PHONE_TO_CLIENT_JSON = os.getenv("PHONE_TO_CLIENT_JSON", "{}")
 WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
 APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama)
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
+# -----------------------------------------------------------------------------
+# Redis yardımcıları (opsiyonel)
+# -----------------------------------------------------------------------------
+_redis_client = None
+
+def get_redis() -> Optional["Redis"]:
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not REDIS_URL or Redis is None:
+        return None
+    try:
+        _redis_client = Redis.from_url(
+            REDIS_URL, password=REDIS_PASSWORD or None, decode_responses=True
+        )
+        # basit ping
+        _redis_client.ping()
+    except Exception as e:
+        print("[Redis] connect error:", e)
+        _redis_client = None
+    return _redis_client
+
+def r_set_json(key: str, value: dict, ttl_sec: int):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.setex(key, ttl_sec, json.dumps(value, ensure_ascii=False))
+    except Exception as e:
+        print("[Redis] set_json error:", e)
+
+def r_get_json(key: str) -> Optional[dict]:
+    r = get_redis()
+    if not r:
+        return None
+    try:
+        v = r.get(key)
+        return json.loads(v) if v else None
+    except Exception as e:
+        print("[Redis] get_json error:", e)
+        return None
+
+def r_set_flag(key: str, ttl_sec: int):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.setex(key, ttl_sec, "1")
+    except Exception as e:
+        print("[Redis] set_flag error:", e)
+
+def r_exists(key: str) -> bool:
+    r = get_redis()
+    if not r:
+        return False
+    try:
+        return bool(r.exists(key))
+    except Exception as e:
+        print("[Redis] exists error:", e)
+        return False
+
+def r_del(key: str):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.delete(key)
+    except Exception as e:
+        print("[Redis] del error:", e)
+
+def r_hincr(name: str, field: str, amount: int = 1):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.hincrby(name, field, amount)
+    except Exception as e:
+        print("[Redis] hincr error:", e)
+
+def r_hgetall(name: str) -> dict:
+    r = get_redis()
+    if not r:
+        return {}
+    try:
+        return r.hgetall(name) or {}
+    except Exception as e:
+        print("[Redis] hgetall error:", e)
+        return {}
+
+def r_sadd(name: str, member: str):
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.sadd(name, member)
+    except Exception as e:
+        print("[Redis] sadd error:", e)
+
+def r_smembers(name: str) -> set:
+    r = get_redis()
+    if not r:
+        return set()
+    try:
+        return set(r.smembers(name))
+    except Exception as e:
+        print("[Redis] smembers error:", e)
+        return set()
 
 # -----------------------------------------------------------------------------
 # Hot-reload cache'leri (Seviye 1)
 # -----------------------------------------------------------------------------
-FAQ_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}
+FAQ_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}  (veya remote cache)
 CFG_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}
 
 def _file_mtime(path: Path) -> float:
@@ -81,10 +197,9 @@ def _file_mtime(path: Path) -> float:
         return 0.0
 
 # -----------------------------------------------------------------------------
-# Yardımcılar: normalize, faq okuma (hot-reload)
+# Yardımcılar: normalize, faq/config okuma (hot-reload)
 # -----------------------------------------------------------------------------
 def norm(s: str) -> str:
-    """Türkçe normalize + küçük harf + trim."""
     if not isinstance(s, str):
         return ""
     s = s.replace("İ", "I").replace("ı", "i")
@@ -93,7 +208,6 @@ def norm(s: str) -> str:
     return s.casefold().strip()
 
 def load_faq(client: str) -> dict[str, str]:
-    """data/<client>/faq.txt -> {anahtar_norm: cevap} (mtime-cache)"""
     path = Path(f"data/{client}/faq.txt")
     mtime = _file_mtime(path)
     cached = FAQ_CACHE.get(client)
@@ -113,7 +227,6 @@ def load_faq(client: str) -> dict[str, str]:
     return out
 
 def load_tenant_cfg(client: str) -> dict:
-    """data/<client>/config.json (mtime-cache) + varsayılanlar"""
     cfg_path = Path(f"data/{client}/config.json")
     mtime = _file_mtime(cfg_path)
     cached = CFG_CACHE.get(client)
@@ -147,7 +260,6 @@ def find_any(faq: dict[str, str], needles: list[str]) -> Optional[str]:
     return None
 
 def fuzzy_find(faq: dict[str, str], user_text_norm: str, threshold: int = 85) -> Optional[str]:
-    """faq anahtarları içinde user_text_norm'a en yakın olanı bulur (partial_ratio)."""
     if not fuzz or not faq:
         return None
     best_score = -1
@@ -162,14 +274,71 @@ def fuzzy_find(faq: dict[str, str], user_text_norm: str, threshold: int = 85) ->
     return None
 
 # -----------------------------------------------------------------------------
+# Kalıcılık sarmalayıcıları (Redis + RAM fallback)
+# -----------------------------------------------------------------------------
+SESSIONS: Dict[Tuple[str, str], dict] = {}   # RAM
+PROCESSED_MSG_IDS: set[str] = set()          # RAM
+STATS_MEM: Dict[str, Dict[str, int]] = {}    # RAM: tenant -> {greeting, menu, faq}
+
+def get_session(client: str, wa_id: str) -> Optional[dict]:
+    key = f"session:{client}:{wa_id}"
+    r_sess = r_get_json(key)
+    if r_sess is not None:
+        return r_sess
+    return SESSIONS.get((client, wa_id))
+
+def set_session(client: str, wa_id: str, data: dict):
+    key = f"session:{client}:{wa_id}"
+    # 30 gün tutalım
+    r_set_json(key, data, ttl_sec=60*60*24*30)
+    SESSIONS[(client, wa_id)] = data
+
+def del_session(client: str, wa_id: str):
+    key = f"session:{client}:{wa_id}"
+    r_del(key)
+    if (client, wa_id) in SESSIONS:
+        del SESSIONS[(client, wa_id)]
+
+def was_processed(msg_id: Optional[str]) -> bool:
+    if not msg_id:
+        return False
+    key = f"msgid:{msg_id}"
+    if r_exists(key):
+        return True
+    r_set_flag(key, ttl_sec=60*60*24*3)  # 3 gün
+    if msg_id in PROCESSED_MSG_IDS:
+        return True
+    PROCESSED_MSG_IDS.add(msg_id)
+    return False
+
+def inc_stat(tenant: str, kind: str):
+    r_sadd("stats:tenants", tenant)
+    r_hincr(f"stats:{tenant}", kind, 1)
+    # RAM fallback
+    t = STATS_MEM.setdefault(tenant, {})
+    t[kind] = t.get(kind, 0) + 1
+
+def read_stats() -> dict:
+    tenants = r_smembers("stats:tenants")
+    out = {}
+    if tenants:
+        for t in tenants:
+            out[t] = r_hgetall(f"stats:{t}")
+    # RAM fallback (Redis yoksa)
+    if not out:
+        out = STATS_MEM
+    # int'e çevir
+    for t, kv in list(out.items()):
+        out[t] = {k: int(v) for k, v in kv.items()}
+    return out
+
+# -----------------------------------------------------------------------------
 # Cevap üretimi
 # -----------------------------------------------------------------------------
 def answer(client: str, question: str) -> str:
-    """SSS eşleştirici (kural bazlı + faq lookup + fuzzy fallback)."""
     faq = load_faq(client)
     s = norm(question)
 
-    # ---- kural bazlı hızlı eşleşmeler ----
     if "kargo" in s:
         return "Kargo: " + (find_any(faq, ["kargo"]) or "Bilgi yok.")
     if "iade" in s:
@@ -201,7 +370,7 @@ def answer(client: str, question: str) -> str:
             or "Bilgi yok."
         )
 
-    # ---- Fuzzy fallback (rapidfuzz) ----
+    # Fuzzy fallback
     try:
         cfg = load_tenant_cfg(client)
         threshold = int(cfg.get("fuzzy_threshold", 85))
@@ -209,9 +378,8 @@ def answer(client: str, question: str) -> str:
         threshold = 85
     fuzzy_val = fuzzy_find(faq, s, threshold)
     if fuzzy_val:
-        return fuzzy_val  # başlıksız, doğrudan faq cevabı
+        return fuzzy_val
 
-    # ---- Son fallback ----
     return "Bu bilgi faq.txt içinde yok."
 
 # -----------------------------------------------------------------------------
@@ -229,16 +397,9 @@ def is_help_like(s: str) -> bool:
     return s in {"yardim", "yardım", "menu", "menü", "liste"}
 
 # -----------------------------------------------------------------------------
-# In-memory durum (prod'da Redis önerilir)
-# -----------------------------------------------------------------------------
-SESSIONS: Dict[Tuple[str, str], dict] = {}   # (client, wa_id) -> {greeted_at: dt}
-PROCESSED_MSG_IDS: set[str] = set()          # idempotency
-
-# -----------------------------------------------------------------------------
 # Tenant çözümleme
 # -----------------------------------------------------------------------------
 def resolve_client(phone_number_id: Optional[str]) -> str:
-    """phone_number_id -> tenant, yoksa DEFAULT_CLIENT."""
     try:
         mapping = json.loads(PHONE_TO_CLIENT_JSON or "{}")
         if phone_number_id and phone_number_id in mapping:
@@ -252,7 +413,7 @@ def resolve_client(phone_number_id: Optional[str]) -> str:
 # -----------------------------------------------------------------------------
 def verify_signature(app_secret: str, raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not app_secret:
-        return True  # APP_SECRET yoksa (dev) doğrulamayı atla
+        return True
     if not signature_header:
         return False
     try:
@@ -327,21 +488,16 @@ def ask(inp: AskIn, request: Request):
 
 @app.post("/admin/reset-session")
 def reset_session(inp: ResetIn):
-    key = (inp.client, inp.wa_id)
-    existed = key in SESSIONS
-    if existed:
-        del SESSIONS[key]
-    return {"ok": True, "removed": existed}
+    del_session(inp.client, inp.wa_id)
+    return {"ok": True}
 
 @app.post("/admin/reset-all-sessions")
 def reset_all_sessions():
     SESSIONS.clear()
-    return {"ok": True, "cleared": True}
+    return {"ok": True, "cleared_ram": True, "note": "Redis oturumları TTL ile kendiliğinden düşer."}
 
 @app.post("/admin/reload-faq")
 def reload_faq(inp: ReloadIn):
-    """Hot-reload: cache'i temizle; bir sonraki çağrıda dosyalar yeniden okunur."""
-    # kapsam
     if inp.client:
         if inp.what in ("faq", "all"):
             FAQ_CACHE.pop(inp.client, None)
@@ -355,6 +511,11 @@ def reload_faq(inp: ReloadIn):
             CFG_CACHE.clear()
         scope = "all"
     return {"ok": True, "reloaded": inp.what, "scope": scope}
+
+@app.get("/admin/stats")
+def stats():
+    """Basit istatistikler (tenant bazında greeting/menu/faq sayıları)."""
+    return {"ok": True, "stats": read_stats()}
 
 # -----------------------------------------------------------------------------
 # WhatsApp Webhook
@@ -393,10 +554,8 @@ async def wa_receive(
 
         # idempotency
         msg_id = msg.get("id")
-        if msg_id and msg_id in PROCESSED_MSG_IDS:
+        if was_processed(msg_id):
             return {"ok": True}
-        if msg_id:
-            PROCESSED_MSG_IDS.add(msg_id)
 
         wa_id = msg["from"]  # kullanıcının WhatsApp numarası
         text = msg.get("text", {}).get("body", "").strip()
@@ -409,36 +568,37 @@ async def wa_receive(
         s = norm(text)
         now = datetime.utcnow()
 
-        # menü/yardım komutu (ayar açıksa)
+        # menü/yardım
         if cfg.get("help_enabled", True) and is_help_like(s):
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, list_menu_text(client))
+            inc_stat(client, "menu")
             logger.info(json.dumps({"evt":"reply","type":"menu","tenant":client,"wa":wa_id[-4:]}))
             return {"ok": True}
 
         # karşılama (ilk mesaj veya cooldown dolmuşsa)
-        sess_key = (client, wa_id)
-        sess = SESSIONS.get(sess_key)
+        sess = get_session(client, wa_id)
         cooldown = int(cfg.get("cooldown_minutes", 120))
         need_greet = False
         if not sess:
             need_greet = True
         else:
-            last = sess.get("greeted_at")
-            if not last or (now - last) > timedelta(minutes=cooldown):
+            last_iso = sess.get("greeted_at")
+            last = datetime.fromisoformat(last_iso) if last_iso else None
+            if (not last) or (now - last) > timedelta(minutes=cooldown):
                 need_greet = True
 
         if need_greet:
-            SESSIONS[sess_key] = {"greeted_at": now}
+            set_session(client, wa_id, {"greeted_at": now.isoformat()})
             greet = cfg.get("greeting", "Hoş geldiniz!")
             if cfg.get("append_menu_to_greeting", True):
                 greet = f"{greet}\n\n{list_menu_text(client)}"
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, greet)
+            inc_stat(client, "greeting")
             logger.info(json.dumps({"evt":"reply","type":"greeting","tenant":client,"wa":wa_id[-4:]}))
-            return {"ok": True}  # hızlı 200
+            return {"ok": True}
 
-        # sadece whitelist'teki konulara cevap ver
+        # sadece whitelist'teki konulara cevap ver (küçük fuzzy toleranslı)
         allowed = any(k in s for k in auto_intents_norm)
-        # (opsiyonel) whitelist için küçük bir fuzzy toleransı:
         if not allowed and fuzz:
             for k in auto_intents_norm:
                 try:
@@ -451,6 +611,7 @@ async def wa_receive(
         if allowed:
             reply = answer(client, text)
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, reply)
+            inc_stat(client, "faq")
             logger.info(json.dumps({"evt":"reply","type":"faq","tenant":client,"wa":wa_id[-4:], "q": s[:80]}))
             return {"ok": True}
 
