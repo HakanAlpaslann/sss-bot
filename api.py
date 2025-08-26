@@ -7,7 +7,7 @@
 # - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
 # - Arka planda gönderim + 429/5xx backoff
 # - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
-# - Admin: reset, hot-reload, stats
+# - Admin: reset, hot-reload, stats (ARTIK Bearer token ile korumalı)
 # - Hot-reload: faq/config mtime cache + /admin/reload-faq
 # - Redis (opsiyonel): session + idempotency + basit istatistik kalıcı
 
@@ -30,9 +30,11 @@ from fastapi import (
     Query,
     Header,
     BackgroundTasks,
+    Depends,  # 👈 eklendi
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer  # 👈 eklendi
 from pydantic import BaseModel
 
 # --- (opsiyonel) bulanık eşleştirme ---
@@ -75,6 +77,22 @@ WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
 APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama)
 REDIS_URL = os.getenv("REDIS_URL", "")
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # 👈 admin koruması için
+
+# -----------------------------------------------------------------------------
+# Admin auth (Bearer)
+# -----------------------------------------------------------------------------
+auth_scheme = HTTPBearer(auto_error=False)
+
+def require_admin(creds: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    # ADMIN_TOKEN tanımlıysa Bearer zorunlu; tanımlı değilse korumayı devre dışı bırak.
+    if not ADMIN_TOKEN:
+        return True
+    if not creds or not creds.credentials or (creds.scheme or "").lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing admin token")
+    if creds.credentials != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return True
 
 # -----------------------------------------------------------------------------
 # Redis yardımcıları (opsiyonel)
@@ -91,7 +109,6 @@ def get_redis() -> Optional["Redis"]:
         _redis_client = Redis.from_url(
             REDIS_URL, password=REDIS_PASSWORD or None, decode_responses=True
         )
-        # basit ping
         _redis_client.ping()
     except Exception as e:
         print("[Redis] connect error:", e)
@@ -187,7 +204,7 @@ def r_smembers(name: str) -> set:
 # -----------------------------------------------------------------------------
 # Hot-reload cache'leri (Seviye 1)
 # -----------------------------------------------------------------------------
-FAQ_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}  (veya remote cache)
+FAQ_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}
 CFG_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}
 
 def _file_mtime(path: Path) -> float:
@@ -289,8 +306,7 @@ def get_session(client: str, wa_id: str) -> Optional[dict]:
 
 def set_session(client: str, wa_id: str, data: dict):
     key = f"session:{client}:{wa_id}"
-    # 30 gün tutalım
-    r_set_json(key, data, ttl_sec=60*60*24*30)
+    r_set_json(key, data, ttl_sec=60*60*24*30)  # 30 gün
     SESSIONS[(client, wa_id)] = data
 
 def del_session(client: str, wa_id: str):
@@ -486,17 +502,17 @@ def health():
 def ask(inp: AskIn, request: Request):
     return {"answer": answer(inp.client, inp.question)}
 
-@app.post("/admin/reset-session")
+@app.post("/admin/reset-session", dependencies=[Depends(require_admin)])  # 👈 korumalı
 def reset_session(inp: ResetIn):
     del_session(inp.client, inp.wa_id)
     return {"ok": True}
 
-@app.post("/admin/reset-all-sessions")
+@app.post("/admin/reset-all-sessions", dependencies=[Depends(require_admin)])  # 👈 korumalı
 def reset_all_sessions():
     SESSIONS.clear()
     return {"ok": True, "cleared_ram": True, "note": "Redis oturumları TTL ile kendiliğinden düşer."}
 
-@app.post("/admin/reload-faq")
+@app.post("/admin/reload-faq", dependencies=[Depends(require_admin)])  # 👈 korumalı
 def reload_faq(inp: ReloadIn):
     if inp.client:
         if inp.what in ("faq", "all"):
@@ -512,7 +528,7 @@ def reload_faq(inp: ReloadIn):
         scope = "all"
     return {"ok": True, "reloaded": inp.what, "scope": scope}
 
-@app.get("/admin/stats")
+@app.get("/admin/stats", dependencies=[Depends(require_admin)])  # 👈 korumalı
 def stats():
     """Basit istatistikler (tenant bazında greeting/menu/faq sayıları)."""
     return {"ok": True, "stats": read_stats()}
@@ -568,7 +584,7 @@ async def wa_receive(
         s = norm(text)
         now = datetime.utcnow()
 
-        # menü/yardım
+        # menü/yardım (senin config'inde help_enabled=false, yani sessiz kalır)
         if cfg.get("help_enabled", True) and is_help_like(s):
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, list_menu_text(client))
             inc_stat(client, "menu")
