@@ -1,12 +1,14 @@
-# api.py — WhatsApp Cloud + FastAPI SSS bot
-# Özellikler:
-# - İlk mesajda karşılama + menü (config ile yönetilir)
-# - Sonrasında sadece auto_intents başlıklarına otomatik cevap, diğerlerine sessiz
-# - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
-# - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
-# - Arka planda mesaj gönderimi + 429/5xx backoff
-# - Admin reset endpoint'leri
+# api.py — WhatsApp Cloud + FastAPI SSS bot (pro sürüm)
 # Python 3.11+
+# Özellikler:
+# - İlk mesajda karşılama + menü (config ile)
+# - Sonrasında sadece auto_intents -> cevap, diğer tüm mesajlara sessiz
+# - Fuzzy fallback (rapidfuzz) ile yazım hatalarında doğru cevabı bulma
+# - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
+# - Arka planda gönderim + 429/5xx backoff
+# - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
+# - Admin reset endpoint'leri
+# - Yapılandırılmış log
 
 import os
 import json
@@ -20,10 +22,23 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import requests
-from fastapi import FastAPI, Request, HTTPException, Query, Header, BackgroundTasks
+from fastapi import (
+    FastAPI,
+    Request,
+    HTTPException,
+    Query,
+    Header,
+    BackgroundTasks,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+
+# --- (opsiyonel) bulanık eşleştirme ---
+try:
+    from rapidfuzz import fuzz  # pip install rapidfuzz
+except Exception:
+    fuzz = None
 
 # -----------------------------------------------------------------------------
 # FastAPI & CORS
@@ -50,10 +65,10 @@ VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")
 DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
 PHONE_TO_CLIENT_JSON = os.getenv("PHONE_TO_CLIENT_JSON", "{}")
 WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
-APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama için)
+APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama)
 
 # -----------------------------------------------------------------------------
-# Yardımcılar: normalize, faq, cevap üretimi
+# Yardımcılar: normalize, faq okuma
 # -----------------------------------------------------------------------------
 def norm(s: str) -> str:
     """Türkçe normalize + küçük harf + trim."""
@@ -85,11 +100,30 @@ def find_any(faq: dict[str, str], needles: list[str]) -> Optional[str]:
                 return val
     return None
 
+def fuzzy_find(faq: dict[str, str], user_text_norm: str, threshold: int = 85) -> Optional[str]:
+    """faq anahtarları içinde user_text_norm'a en yakın olanı bulur (partial_ratio)."""
+    if not fuzz or not faq:
+        return None
+    best_score = -1
+    best_val = None
+    for k_norm, val in faq.items():
+        score = fuzz.partial_ratio(user_text_norm, k_norm)
+        if score > best_score:
+            best_score = score
+            best_val = val
+    if best_score >= threshold:
+        return best_val
+    return None
+
+# -----------------------------------------------------------------------------
+# Cevap üretimi
+# -----------------------------------------------------------------------------
 def answer(client: str, question: str) -> str:
-    """Basit SSS eşleştirici (anahtar kelime + faq.txt lookup)."""
+    """SSS eşleştirici (kural bazlı + faq lookup + fuzzy fallback)."""
     faq = load_faq(client)
     s = norm(question)
 
+    # ---- kural bazlı hızlı eşleşmeler ----
     if "kargo" in s:
         return "Kargo: " + (find_any(faq, ["kargo"]) or "Bilgi yok.")
     if "iade" in s:
@@ -120,6 +154,18 @@ def answer(client: str, question: str) -> str:
             )
             or "Bilgi yok."
         )
+
+    # ---- Fuzzy fallback (rapidfuzz) ----
+    try:
+        cfg = load_tenant_cfg(client)
+        threshold = int(cfg.get("fuzzy_threshold", 85))
+    except Exception:
+        threshold = 85
+    fuzzy_val = fuzzy_find(faq, s, threshold)
+    if fuzzy_val:
+        return fuzzy_val  # başlıksız, doğrudan faq cevabı
+
+    # ---- Son fallback ----
     return "Bu bilgi faq.txt içinde yok."
 
 # -----------------------------------------------------------------------------
@@ -139,6 +185,7 @@ def load_tenant_cfg(client: str) -> dict:
         "cooldown_minutes": 120,
         "append_menu_to_greeting": True,
         "help_enabled": True,
+        # "fuzzy_threshold": 85    # eklemezsen 85 kabul edilir
     }
 
 def list_menu_text(client: str) -> str:
@@ -176,12 +223,11 @@ def resolve_client(phone_number_id: Optional[str]) -> str:
 # -----------------------------------------------------------------------------
 def verify_signature(app_secret: str, raw_body: bytes, signature_header: Optional[str]) -> bool:
     if not app_secret:
-        return True  # APP_SECRET yoksa (dev ortamı) doğrulamayı atla
+        return True  # APP_SECRET yoksa (dev) doğrulamayı atla
     if not signature_header:
         return False
-    # Header genelde "sha256=<hex>" şeklinde gelir
     try:
-        provided = signature_header.split("=", 1)[-1].strip()
+        provided = signature_header.split("=", 1)[-1].strip()  # "sha256=<hex>" -> hex
     except Exception:
         return False
     digest = hmac.new(app_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
@@ -283,7 +329,6 @@ async def wa_receive(
     # --- imza doğrulama ---
     raw = await request.body()
     if not verify_signature(APP_SECRET, raw, x_hub_signature_256):
-        # İmza hatalı → 403 (Meta tekrar deneyecek; ayarı düzeltmen gerekir)
         raise HTTPException(status_code=403, detail="bad signature")
 
     data = json.loads(raw.decode("utf-8") or "{}")
@@ -344,7 +389,7 @@ async def wa_receive(
         if any(k in s for k in auto_intents_norm):
             reply = answer(client, text)
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, reply)
-            logger.info(json.dumps({"evt":"reply","type":"faq","tenant":client,"wa":wa_id[-4:], "q": s[:50]}))
+            logger.info(json.dumps({"evt":"reply","type":"faq","tenant":client,"wa":wa_id[-4:], "q": s[:80]}))
             return {"ok": True}
 
         # izinli değilse sessiz kal
