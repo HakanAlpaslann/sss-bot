@@ -1,4 +1,4 @@
-# api.py — WhatsApp Cloud + FastAPI SSS bot (pro sürüm)
+# api.py — WhatsApp Cloud + FastAPI SSS bot (hot-reload sürümü)
 # Python 3.11+
 # Özellikler:
 # - İlk mesajda karşılama + menü (config ile)
@@ -7,8 +7,9 @@
 # - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
 # - Arka planda gönderim + 429/5xx backoff
 # - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
-# - Admin reset endpoint'leri
+# - Admin reset + hot-reload endpoint'leri
 # - Yapılandırılmış log
+# - Seviye 1 hot-reload: faq/config diskten okuma mtime-cache + /admin/reload-faq
 
 import os
 import json
@@ -68,7 +69,19 @@ WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
 APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama)
 
 # -----------------------------------------------------------------------------
-# Yardımcılar: normalize, faq okuma
+# Hot-reload cache'leri (Seviye 1)
+# -----------------------------------------------------------------------------
+FAQ_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}
+CFG_CACHE: dict[str, dict] = {}  # {client: {"mtime": float, "data": dict}}
+
+def _file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+# -----------------------------------------------------------------------------
+# Yardımcılar: normalize, faq okuma (hot-reload)
 # -----------------------------------------------------------------------------
 def norm(s: str) -> str:
     """Türkçe normalize + küçük harf + trim."""
@@ -80,18 +93,51 @@ def norm(s: str) -> str:
     return s.casefold().strip()
 
 def load_faq(client: str) -> dict[str, str]:
-    """data/<client>/faq.txt -> {anahtar_norm: cevap}"""
+    """data/<client>/faq.txt -> {anahtar_norm: cevap} (mtime-cache)"""
     path = Path(f"data/{client}/faq.txt")
+    mtime = _file_mtime(path)
+    cached = FAQ_CACHE.get(client)
+    if cached and cached.get("mtime") == mtime:
+        return cached["data"]
+
     out: dict[str, str] = {}
-    if not path.exists():
-        return out
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        out[norm(k)] = v.strip()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            out[norm(k)] = v.strip()
+
+    FAQ_CACHE[client] = {"mtime": mtime, "data": out}
     return out
+
+def load_tenant_cfg(client: str) -> dict:
+    """data/<client>/config.json (mtime-cache) + varsayılanlar"""
+    cfg_path = Path(f"data/{client}/config.json")
+    mtime = _file_mtime(cfg_path)
+    cached = CFG_CACHE.get(client)
+    if cached and cached.get("mtime") == mtime:
+        return cached["data"]
+
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            CFG_CACHE[client] = {"mtime": mtime, "data": data}
+            return data
+        except Exception:
+            pass
+
+    data = {
+        "greeting": "Hoş geldiniz! Yardım için 'menü' yazın.",
+        "auto_intents": [],
+        "cooldown_minutes": 120,
+        "append_menu_to_greeting": True,
+        "help_enabled": True,
+        # "fuzzy_threshold": 85
+    }
+    CFG_CACHE[client] = {"mtime": mtime, "data": data}
+    return data
 
 def find_any(faq: dict[str, str], needles: list[str]) -> Optional[str]:
     for k_norm, val in faq.items():
@@ -171,23 +217,6 @@ def answer(client: str, question: str) -> str:
 # -----------------------------------------------------------------------------
 # Tenant config (greeting + whitelist)
 # -----------------------------------------------------------------------------
-def load_tenant_cfg(client: str) -> dict:
-    cfg_path = Path(f"data/{client}/config.json")
-    if cfg_path.exists():
-        try:
-            return json.loads(cfg_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    # varsayılan
-    return {
-        "greeting": "Hoş geldiniz! Yardım için 'menü' yazın.",
-        "auto_intents": [],
-        "cooldown_minutes": 120,
-        "append_menu_to_greeting": True,
-        "help_enabled": True,
-        # "fuzzy_threshold": 85    # eklemezsen 85 kabul edilir
-    }
-
 def list_menu_text(client: str) -> str:
     cfg = load_tenant_cfg(client)
     items = cfg.get("auto_intents", [])
@@ -280,6 +309,10 @@ class ResetIn(BaseModel):
     client: str
     wa_id: str  # +90 ile başlayan kullanıcı numarası
 
+class ReloadIn(BaseModel):
+    client: Optional[str] = None      # belirtilirse tek tenant, boşsa hepsi
+    what: str = "all"                 # "faq" | "config" | "all"
+
 @app.get("/")
 def root():
     return {"message": "SSS Bot API. Test: /docs  |  Soru: POST /ask"}
@@ -304,6 +337,24 @@ def reset_session(inp: ResetIn):
 def reset_all_sessions():
     SESSIONS.clear()
     return {"ok": True, "cleared": True}
+
+@app.post("/admin/reload-faq")
+def reload_faq(inp: ReloadIn):
+    """Hot-reload: cache'i temizle; bir sonraki çağrıda dosyalar yeniden okunur."""
+    # kapsam
+    if inp.client:
+        if inp.what in ("faq", "all"):
+            FAQ_CACHE.pop(inp.client, None)
+        if inp.what in ("config", "all"):
+            CFG_CACHE.pop(inp.client, None)
+        scope = f"client:{inp.client}"
+    else:
+        if inp.what in ("faq", "all"):
+            FAQ_CACHE.clear()
+        if inp.what in ("config", "all"):
+            CFG_CACHE.clear()
+        scope = "all"
+    return {"ok": True, "reloaded": inp.what, "scope": scope}
 
 # -----------------------------------------------------------------------------
 # WhatsApp Webhook
@@ -386,7 +437,18 @@ async def wa_receive(
             return {"ok": True}  # hızlı 200
 
         # sadece whitelist'teki konulara cevap ver
-        if any(k in s for k in auto_intents_norm):
+        allowed = any(k in s for k in auto_intents_norm)
+        # (opsiyonel) whitelist için küçük bir fuzzy toleransı:
+        if not allowed and fuzz:
+            for k in auto_intents_norm:
+                try:
+                    if fuzz.partial_ratio(s, k) >= 80:
+                        allowed = True
+                        break
+                except Exception:
+                    pass
+
+        if allowed:
             reply = answer(client, text)
             background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, reply)
             logger.info(json.dumps({"evt":"reply","type":"faq","tenant":client,"wa":wa_id[-4:], "q": s[:80]}))
