@@ -3,3 +3,4 @@ uvicorn[standard]
 python-dotenv
 requests
 rapidfuzz>=3.0.0
+redis>=5.0.0
