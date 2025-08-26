@@ -1,26 +1,34 @@
 # api.py — WhatsApp Cloud + FastAPI SSS bot
-# Özellikler: karşılama+menü tek mesajda, whitelist auto-intents, sessiz mod, multi-tenant hazır
+# Özellikler:
+# - İlk mesajda karşılama + menü (config ile yönetilir)
+# - Sonrasında sadece auto_intents başlıklarına otomatik cevap, diğerlerine sessiz
+# - Multi-tenant hazır (PHONE_TO_CLIENT_JSON)
+# - Webhook imza doğrulama (X-Hub-Signature-256, APP_SECRET)
+# - Arka planda mesaj gönderimi + 429/5xx backoff
+# - Admin reset endpoint'leri
 # Python 3.11+
 
 import os
 import json
+import time
+import hmac
+import hashlib
 import unicodedata
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import requests
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, Request, HTTPException, Query, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 # -----------------------------------------------------------------------------
-# FastAPI
+# FastAPI & CORS
 # -----------------------------------------------------------------------------
 app = FastAPI(title="SSS Bot API")
-
-# ----- CORS -----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -29,20 +37,23 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Ortam değişkenleri
+# Logging
 # -----------------------------------------------------------------------------
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")  # System User ile alınmış kalıcı token
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")  # webhook doğrulama tokenı
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("sss-bot")
+
+# -----------------------------------------------------------------------------
+# Env
+# -----------------------------------------------------------------------------
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "mybotverify")
 DEFAULT_CLIENT = os.getenv("DEFAULT_CLIENT", "dayi")
-
-# Çok müşterili eşleme (opsiyonel): {"phone_number_id":"tenant", ...}
 PHONE_TO_CLIENT_JSON = os.getenv("PHONE_TO_CLIENT_JSON", "{}")
-
-# Fallback phone id (opsiyonel): eventte gelmezse buradan alır
 WHATSAPP_PHONE_ID_FALLBACK = os.getenv("WHATSAPP_PHONE_ID", "")
+APP_SECRET = os.getenv("APP_SECRET", "")  # Meta App Secret (imza doğrulama için)
 
 # -----------------------------------------------------------------------------
-# Yardımcılar (normalize, faq yükleme, cevap)
+# Yardımcılar: normalize, faq, cevap üretimi
 # -----------------------------------------------------------------------------
 def norm(s: str) -> str:
     """Türkçe normalize + küçük harf + trim."""
@@ -75,7 +86,7 @@ def find_any(faq: dict[str, str], needles: list[str]) -> Optional[str]:
     return None
 
 def answer(client: str, question: str) -> str:
-    """Basit SSS eşleştirici (intent anahtar kelimeleri + faq.txt lookup)."""
+    """Basit SSS eşleştirici (anahtar kelime + faq.txt lookup)."""
     faq = load_faq(client)
     s = norm(question)
 
@@ -112,7 +123,7 @@ def answer(client: str, question: str) -> str:
     return "Bu bilgi faq.txt içinde yok."
 
 # -----------------------------------------------------------------------------
-# Tenant config (karşılama + whitelist)
+# Tenant config (greeting + whitelist)
 # -----------------------------------------------------------------------------
 def load_tenant_cfg(client: str) -> dict:
     cfg_path = Path(f"data/{client}/config.json")
@@ -121,13 +132,13 @@ def load_tenant_cfg(client: str) -> dict:
             return json.loads(cfg_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    # Varsayılan ayarlar
+    # varsayılan
     return {
         "greeting": "Hoş geldiniz! Yardım için 'menü' yazın.",
         "auto_intents": [],
         "cooldown_minutes": 120,
-        "append_menu_to_greeting": True,  # karşılama altına menü ekle
-        "help_enabled": True,             # menü/yardım komutunu aç/kapa
+        "append_menu_to_greeting": True,
+        "help_enabled": True,
     }
 
 def list_menu_text(client: str) -> str:
@@ -142,7 +153,7 @@ def is_help_like(s: str) -> bool:
     return s in {"yardim", "yardım", "menu", "menü", "liste"}
 
 # -----------------------------------------------------------------------------
-# Basit durum saklama (RAM)
+# In-memory durum (prod'da Redis önerilir)
 # -----------------------------------------------------------------------------
 SESSIONS: Dict[Tuple[str, str], dict] = {}   # (client, wa_id) -> {greeted_at: dt}
 PROCESSED_MSG_IDS: set[str] = set()          # idempotency
@@ -161,42 +172,67 @@ def resolve_client(phone_number_id: Optional[str]) -> str:
     return DEFAULT_CLIENT
 
 # -----------------------------------------------------------------------------
-# WhatsApp gönderim
+# İmza doğrulama (X-Hub-Signature-256)
+# -----------------------------------------------------------------------------
+def verify_signature(app_secret: str, raw_body: bytes, signature_header: Optional[str]) -> bool:
+    if not app_secret:
+        return True  # APP_SECRET yoksa (dev ortamı) doğrulamayı atla
+    if not signature_header:
+        return False
+    # Header genelde "sha256=<hex>" şeklinde gelir
+    try:
+        provided = signature_header.split("=", 1)[-1].strip()
+    except Exception:
+        return False
+    digest = hmac.new(app_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, provided)
+
+# -----------------------------------------------------------------------------
+# WhatsApp gönderim (retry/backoff'lu)
 # -----------------------------------------------------------------------------
 def send_whatsapp_text(phone_number_id: Optional[str], to_wa_id: str, text: str):
-    """Meta Graph send API (v20). Gelen event'teki phone_number_id varsa onu kullan."""
     if not WHATSAPP_TOKEN:
-        print("[WA] missing WHATSAPP_TOKEN")
-        return
+        print("[WA] missing WHATSAPP_TOKEN"); return
     phone_id = phone_number_id or WHATSAPP_PHONE_ID_FALLBACK
     if not phone_id:
-        print("[WA] phone_number_id missing")
-        return
+        print("[WA] phone_number_id missing"); return
 
     url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
         "to": to_wa_id,
         "type": "text",
         "text": {"body": text},
     }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        if r.status_code >= 400:
+
+    for attempt in range(3):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            if r.status_code < 400:
+                return
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = 2 ** attempt
+                print(f"[WA backoff] {r.status_code} attempt={attempt+1} wait={wait}s {r.text}")
+                time.sleep(wait)
+                continue
             print("[WA send error]", r.status_code, r.text)
-    except Exception as e:
-        print("[WA send error]", e)
+            return
+        except Exception as e:
+            wait = 2 ** attempt
+            print("[WA send error]", e, f"attempt={attempt+1} wait={wait}s")
+            time.sleep(wait)
 
 # -----------------------------------------------------------------------------
-# HTTP API (test amaçlı)
+# HTTP API (test & admin)
 # -----------------------------------------------------------------------------
 class AskIn(BaseModel):
     client: str
     question: str
+
+class ResetIn(BaseModel):
+    client: str
+    wa_id: str  # +90 ile başlayan kullanıcı numarası
 
 @app.get("/")
 def root():
@@ -209,6 +245,19 @@ def health():
 @app.post("/ask")
 def ask(inp: AskIn, request: Request):
     return {"answer": answer(inp.client, inp.question)}
+
+@app.post("/admin/reset-session")
+def reset_session(inp: ResetIn):
+    key = (inp.client, inp.wa_id)
+    existed = key in SESSIONS
+    if existed:
+        del SESSIONS[key]
+    return {"ok": True, "removed": existed}
+
+@app.post("/admin/reset-all-sessions")
+def reset_all_sessions():
+    SESSIONS.clear()
+    return {"ok": True, "cleared": True}
 
 # -----------------------------------------------------------------------------
 # WhatsApp Webhook
@@ -226,8 +275,18 @@ def wa_verify(
 
 # 2) POST receive
 @app.post("/whatsapp/webhook")
-async def wa_receive(request: Request):
-    data = await request.json()
+async def wa_receive(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_hub_signature_256: Optional[str] = Header(default=None, alias="X-Hub-Signature-256"),
+):
+    # --- imza doğrulama ---
+    raw = await request.body()
+    if not verify_signature(APP_SECRET, raw, x_hub_signature_256):
+        # İmza hatalı → 403 (Meta tekrar deneyecek; ayarı düzeltmen gerekir)
+        raise HTTPException(status_code=403, detail="bad signature")
+
+    data = json.loads(raw.decode("utf-8") or "{}")
     try:
         entry = data["entry"][0]["changes"][0]["value"]
         messages = entry.get("messages")
@@ -243,11 +302,11 @@ async def wa_receive(request: Request):
         if msg_id:
             PROCESSED_MSG_IDS.add(msg_id)
 
-        wa_id = msg["from"]                           # kullanıcının WA numarası
+        wa_id = msg["from"]  # kullanıcının WhatsApp numarası
         text = msg.get("text", {}).get("body", "").strip()
         phone_number_id = entry.get("metadata", {}).get("phone_number_id")
 
-        # tenant belirle
+        # tenant
         client = resolve_client(phone_number_id)
         cfg = load_tenant_cfg(client)
         auto_intents_norm = [norm(x) for x in cfg.get("auto_intents", [])]
@@ -256,7 +315,8 @@ async def wa_receive(request: Request):
 
         # menü/yardım komutu (ayar açıksa)
         if cfg.get("help_enabled", True) and is_help_like(s):
-            send_whatsapp_text(phone_number_id, wa_id, list_menu_text(client))
+            background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, list_menu_text(client))
+            logger.info(json.dumps({"evt":"reply","type":"menu","tenant":client,"wa":wa_id[-4:]}))
             return {"ok": True}
 
         # karşılama (ilk mesaj veya cooldown dolmuşsa)
@@ -276,13 +336,15 @@ async def wa_receive(request: Request):
             greet = cfg.get("greeting", "Hoş geldiniz!")
             if cfg.get("append_menu_to_greeting", True):
                 greet = f"{greet}\n\n{list_menu_text(client)}"
-            send_whatsapp_text(phone_number_id, wa_id, greet)
-            return {"ok": True}  # sadece karşılama gönder
+            background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, greet)
+            logger.info(json.dumps({"evt":"reply","type":"greeting","tenant":client,"wa":wa_id[-4:]}))
+            return {"ok": True}  # hızlı 200
 
         # sadece whitelist'teki konulara cevap ver
         if any(k in s for k in auto_intents_norm):
             reply = answer(client, text)
-            send_whatsapp_text(phone_number_id, wa_id, reply)
+            background_tasks.add_task(send_whatsapp_text, phone_number_id, wa_id, reply)
+            logger.info(json.dumps({"evt":"reply","type":"faq","tenant":client,"wa":wa_id[-4:], "q": s[:50]}))
             return {"ok": True}
 
         # izinli değilse sessiz kal
